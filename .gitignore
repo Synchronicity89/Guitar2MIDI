@@ -1,0 +1,9 @@
+Audio_Samples/*
+*.mid
+__pycache__/
+*.pyc
+audio_midi_env/
+audio_midi_env_ubuntu/
+audio_midi_env_ubuntu311/
+
+!Audio_Samples/
