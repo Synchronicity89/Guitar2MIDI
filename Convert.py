@@ -14,38 +14,49 @@ import tempfile
 import time
 import librosa
 import numpy as np
+import pretty_midi
 import soundfile as sf
 from scipy import signal
-from basic_pitch.inference import predict
 
 
 LOW_B1_HZ = 61.74
+HIGH_E_21ST_FRET_HZ = 1108.73
 LOW_B1_MIDI_FLOOR_HZ = 55.0
 DEFAULT_LOWCUT_HZ = 40.0
-DEFAULT_HIGHCUT_HZ = 5000.0
+DEFAULT_HIGHCUT_HZ = 1200.0
 DEFAULT_MAX_FREQUENCY_HZ = 1500.0
 DEFAULT_NORMALIZE_PEAK = 0.98
 MIN_TRANSPOSE_SEMITONES = -12
 MAX_TRANSPOSE_SEMITONES = 12
 DEFAULT_MIN_NOTE_LEN_MS = 20
 DEFAULT_MIN_VELOCITY = 1
+DEFAULT_TRANSCRIPTION_BACKEND = "omnizart"
 DEFAULT_TRANSPOSE_BACKEND = "ffmpeg"
 DEFAULT_LOW_B_BOOST_DB = 8.0
 DEFAULT_LOW_B_BOOST_Q = 0.8
 DEFAULT_HARMONIC_ATTENUATION_DB = 6.0
 DEFAULT_HARMONIC_NOTCH_Q = 5.0
 DEFAULT_HARMONIC_COUNT = 3
+LOWCUT_FILTER_ORDER = 4
+HIGHCUT_FILTER_ORDER = 8
+DEFAULT_OMNIZART_COMMAND_CANDIDATES = (
+    os.environ.get("OMNIZART_COMMAND"),
+    "omnizart",
+    "/tmp/omnizart_env/bin/omnizart",
+)
 
 
 def apply_bandpass_filter(audio: np.ndarray, sr: int, lowcut: float = DEFAULT_LOWCUT_HZ, highcut: float = DEFAULT_HIGHCUT_HZ) -> np.ndarray:
-    """Applies a 4th-order Butterworth bandpass filter using Second-Order Sections."""
+    """Applies a guitar-focused high-pass plus a steeper low-pass rolloff using SOS filters."""
     # Nyquist frequency guard
     nyq = 0.5 * sr
     highcut = min(highcut, nyq - 100.0)
-    
-    # Keep the cutoff comfortably below a 7-string guitar low B1 fundamental.
-    sos = signal.butter(4, [lowcut, highcut], btype='bandpass', fs=sr, output='sos')
-    filtered = signal.sosfilt(sos, audio)
+
+    # Preserve the 7-string low B1 fundamental while sharply rolling off above the upper fretboard range.
+    highpass_sos = signal.butter(LOWCUT_FILTER_ORDER, lowcut, btype='highpass', fs=sr, output='sos')
+    lowpass_sos = signal.butter(HIGHCUT_FILTER_ORDER, highcut, btype='lowpass', fs=sr, output='sos')
+    filtered = signal.sosfilt(highpass_sos, audio)
+    filtered = signal.sosfilt(lowpass_sos, filtered)
     return filtered.astype(np.float32)
 
 
@@ -260,9 +271,78 @@ def cleanup_midi(midi_data, min_velocity: int = DEFAULT_MIN_VELOCITY, min_durati
     return midi_data
 
 
+def resolve_omnizart_command(configured_command: str | None = None) -> str:
+    """Finds an Omnizart CLI binary from an explicit path, PATH, or the known WSL test env."""
+    candidates = []
+    if configured_command:
+        candidates.append(configured_command)
+    candidates.extend(DEFAULT_OMNIZART_COMMAND_CANDIDATES)
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+
+    raise RuntimeError(
+        "Omnizart is not installed in the active environment and no fallback command was found. "
+        "Set OMNIZART_COMMAND, pass --omnizart-command, or use --backend basic-pitch."
+    )
+
+
+def run_basic_pitch_inference(
+    input_wav: str,
+    onset_thresh: float,
+    frame_thresh: float,
+    min_note_len_ms: int,
+    minimum_frequency: float,
+    maximum_frequency: float,
+):
+    """Runs Basic Pitch on a preprocessed WAV and returns a PrettyMIDI object."""
+    try:
+        from basic_pitch.inference import predict
+    except ImportError as exc:
+        raise RuntimeError(
+            "basic-pitch is not installed in the active environment. "
+            "Install the Basic Pitch stack or use --backend omnizart."
+        ) from exc
+
+    _, midi_data, _ = predict(
+        input_wav,
+        onset_threshold=onset_thresh,
+        frame_threshold=frame_thresh,
+        minimum_note_length=min_note_len_ms,
+        minimum_frequency=minimum_frequency,
+        maximum_frequency=maximum_frequency,
+        melodia_trick=False,
+    )
+    return midi_data
+
+
+def run_omnizart_inference(input_wav: str, output_mid: str, omnizart_command: str | None = None) -> pretty_midi.PrettyMIDI:
+    """Runs Omnizart via its CLI and loads the resulting MIDI for post-cleanup."""
+    resolved_command = resolve_omnizart_command(omnizart_command)
+
+    command = [
+        resolved_command,
+        "music",
+        "transcribe",
+        input_wav,
+        "-o",
+        output_mid,
+    ]
+    subprocess.run(command, check=True)
+    return pretty_midi.PrettyMIDI(output_mid)
+
+
 def convert_wav_to_midi(
     input_wav: str,
     output_mid: str,
+    transcription_backend: str = DEFAULT_TRANSCRIPTION_BACKEND,
+    omnizart_command: str | None = None,
     onset_thresh: float = 0.60,
     frame_thresh: float = 0.35,
     min_note_len_ms: int = DEFAULT_MIN_NOTE_LEN_MS,
@@ -303,18 +383,22 @@ def convert_wav_to_midi(
     )
 
     try:
-        print("[*] Running polyphonic neural inference...")
-        # Note limits cover 7-string low B1 (61.74 Hz) through the upper guitar range.
+        print(f"[*] Running {transcription_backend} transcription...")
         stage_start = time.perf_counter()
-        _, midi_data, _ = predict(
-            temp_wav_path,
-            onset_threshold=onset_thresh,
-            frame_threshold=frame_thresh,
-            minimum_note_length=min_note_len_ms,
-            minimum_frequency=minimum_frequency,
-            maximum_frequency=maximum_frequency,
-            melodia_trick=False  # Disabled to preserve independent polyphonic chord decays
-        )
+        if transcription_backend == "omnizart":
+            midi_data = run_omnizart_inference(temp_wav_path, output_mid, omnizart_command=omnizart_command)
+        elif transcription_backend == "basic-pitch":
+            # Note limits cover 7-string low B1 (61.74 Hz) through the upper guitar range.
+            midi_data = run_basic_pitch_inference(
+                temp_wav_path,
+                onset_thresh,
+                frame_thresh,
+                min_note_len_ms,
+                minimum_frequency,
+                maximum_frequency,
+            )
+        else:
+            raise ValueError(f"Unsupported transcription backend: {transcription_backend}")
         timings["inference_sec"] = time.perf_counter() - stage_start
 
         print(f"[*] Filtering ghost notes (vel < {min_velocity}, len < {min_note_len_ms}ms)...")
@@ -342,12 +426,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert guitar WAV audio to polyphonic MIDI.")
     parser.add_argument("input", help="Path to input .wav file")
     parser.add_argument("-o", "--output", help="Path to output .mid file", default=None)
+    parser.add_argument("--backend", choices=["omnizart", "basic-pitch"], default=DEFAULT_TRANSCRIPTION_BACKEND, help="Transcription backend to use (default: omnizart)")
+    parser.add_argument("--omnizart-command", default=None, help="Optional path or command name for the Omnizart CLI when using --backend omnizart")
     parser.add_argument("--onset", type=float, default=0.60, help="Onset sensitivity threshold [0.1 - 0.9] (default: 0.60)")
     parser.add_argument("--frame", type=float, default=0.35, help="Frame sustain threshold [0.1 - 0.9] (default: 0.35)")
     parser.add_argument("--min-len", type=int, default=DEFAULT_MIN_NOTE_LEN_MS, help="Minimum note length in ms (default: 20)")
     parser.add_argument("--min-vel", type=int, default=DEFAULT_MIN_VELOCITY, help="Minimum MIDI velocity threshold (default: 1)")
     parser.add_argument("--lowcut", type=float, default=DEFAULT_LOWCUT_HZ, help="Band-pass low cutoff in Hz (default: 40.0 for 7-string low B support)")
-    parser.add_argument("--highcut", type=float, default=DEFAULT_HIGHCUT_HZ, help="Band-pass high cutoff in Hz (default: 5000.0)")
+    parser.add_argument("--highcut", type=float, default=DEFAULT_HIGHCUT_HZ, help=f"Sharp high-frequency rolloff in Hz (default: {DEFAULT_HIGHCUT_HZ:.1f}, just above the high E 21st fret at {HIGH_E_21ST_FRET_HZ:.2f} Hz)")
     parser.add_argument("--min-freq", type=float, default=LOW_B1_MIDI_FLOOR_HZ, help="Inference minimum frequency in Hz (default: 55.0 to include 7-string low B1 at 61.74 Hz)")
     parser.add_argument("--max-freq", type=float, default=DEFAULT_MAX_FREQUENCY_HZ, help="Inference maximum frequency in Hz (default: 1500.0)")
     parser.add_argument("--transpose", type=float, default=0.0, help="Pitch-shift the source audio before inference in semitones, from -12 to +12 (default: 0)")
@@ -377,6 +463,8 @@ if __name__ == "__main__":
     convert_wav_to_midi(
         args.input,
         out_file,
+        transcription_backend=args.backend,
+        omnizart_command=args.omnizart_command,
         onset_thresh=args.onset,
         frame_thresh=args.frame,
         min_note_len_ms=args.min_len,
