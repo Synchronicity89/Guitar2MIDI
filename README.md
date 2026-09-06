@@ -7,9 +7,12 @@ Polyphonic guitar audio-to-MIDI conversion using a small DSP preprocessing stage
 - Reads a WAV file
 - Downmixes stereo to mono
 - Applies a band-pass filter for guitar-friendly frequencies
-- Normalizes the signal before inference
+- Normalizes the signal to near full scale after the rest of preprocessing
 - Runs Basic Pitch transcription
 - Removes short or low-velocity ghost notes
+- Can transpose the source audio by up to one octave before inference
+- Can export the exact fully preprocessed WAV that is fed into transcription
+- Prints per-stage timing so preprocessing and inference cost are visible
 - Writes a `.mid` file
 
 ## Requirements
@@ -53,6 +56,28 @@ Adjust transcription sensitivity:
 ```bash
 python Convert.py Audio_Samples/andyguitar1.wav --onset 0.55 --frame 0.30 --min-len 70 --min-vel 25
 ```
+
+Transpose the source up by one octave before transcription:
+
+```bash
+python Convert.py Audio_Samples/andyguitar1.wav --transpose 12
+```
+
+Save the fully preprocessed audio that will be sent into inference:
+
+```bash
+python Convert.py Audio_Samples/andyguitar1.wav --save-preprocessed Audio_Samples/andyguitar1_preprocessed.wav
+```
+
+The current defaults are intentionally permissive for low 7-string note recovery:
+
+- `--transpose 0`
+- `--min-len 20`
+- `--min-vel 1`
+
+This may admit extra junk notes, which can be tuned down later.
+
+The default normalization target is `--normalize-peak 0.98`, applied after transpose and filtering.
 
 ## Sample Files
 
