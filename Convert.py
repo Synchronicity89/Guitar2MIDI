@@ -8,6 +8,8 @@ Applies pre-filtering DSP -> Basic Pitch NN Inference -> MIDI cleanup.
 import argparse
 import math
 import os
+import shutil
+import subprocess
 import tempfile
 import time
 import librosa
@@ -27,6 +29,7 @@ MIN_TRANSPOSE_SEMITONES = -12
 MAX_TRANSPOSE_SEMITONES = 12
 DEFAULT_MIN_NOTE_LEN_MS = 20
 DEFAULT_MIN_VELOCITY = 1
+DEFAULT_TRANSPOSE_BACKEND = "ffmpeg"
 DEFAULT_LOW_B_BOOST_DB = 8.0
 DEFAULT_LOW_B_BOOST_Q = 0.8
 DEFAULT_HARMONIC_ATTENUATION_DB = 6.0
@@ -117,11 +120,51 @@ def enhance_low_b_fundamental(
     )
 
 
-def shift_audio_key(audio: np.ndarray, sr: int, semitones: float) -> np.ndarray:
+def shift_audio_key_with_librosa(audio: np.ndarray, sr: int, semitones: float) -> np.ndarray:
     """Shifts pitch without changing duration."""
     if semitones == 0:
         return audio
     return librosa.effects.pitch_shift(audio, sr=sr, n_steps=semitones)
+
+
+def shift_audio_key_with_ffmpeg(input_wav: str, semitones: float) -> tuple[np.ndarray, int]:
+    """Uses ffmpeg rubberband to shift pitch without changing duration."""
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg is required for transpose-backend=ffmpeg")
+
+    temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    temp_file.close()
+    try:
+        ratio = 2.0 ** (semitones / 12.0)
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            input_wav,
+            "-vn",
+            "-af",
+            f"rubberband=pitch={ratio}",
+            temp_file.name,
+        ]
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        shifted, sr = sf.read(temp_file.name, dtype="float32")
+        if shifted.ndim > 1:
+            shifted = np.mean(shifted, axis=1)
+        return shifted, sr
+    finally:
+        if os.path.exists(temp_file.name):
+            os.remove(temp_file.name)
+
+
+def shift_audio_key(input_wav: str, audio: np.ndarray, sr: int, semitones: float, backend: str) -> tuple[np.ndarray, int]:
+    """Shifts pitch without changing duration using the requested backend."""
+    if semitones == 0:
+        return audio, sr
+    if backend == "ffmpeg":
+        return shift_audio_key_with_ffmpeg(input_wav, semitones)
+    if backend == "librosa":
+        return shift_audio_key_with_librosa(audio, sr, semitones), sr
+    raise ValueError(f"Unsupported transpose backend: {backend}")
 
 
 def normalize_audio(audio: np.ndarray, target_peak: float = DEFAULT_NORMALIZE_PEAK) -> np.ndarray:
@@ -137,6 +180,7 @@ def preprocess_audio(
     lowcut: float,
     highcut: float,
     transpose_semitones: float,
+    transpose_backend: str,
     normalize_peak: float,
     low_b_boost_db: float,
     low_b_boost_q: float,
@@ -159,7 +203,7 @@ def preprocess_audio(
     timings["downmix_sec"] = time.perf_counter() - stage_start
 
     stage_start = time.perf_counter()
-    shifted = shift_audio_key(data, sr, transpose_semitones)
+    shifted, sr = shift_audio_key(input_wav, data, sr, transpose_semitones, transpose_backend)
     timings["transpose_sec"] = time.perf_counter() - stage_start
 
     # Filter out DC offsets, handling noise, and ultrasonic string noise
@@ -228,6 +272,7 @@ def convert_wav_to_midi(
     minimum_frequency: float = LOW_B1_MIDI_FLOOR_HZ,
     maximum_frequency: float = DEFAULT_MAX_FREQUENCY_HZ,
     transpose_semitones: float = 0.0,
+    transpose_backend: str = DEFAULT_TRANSPOSE_BACKEND,
     normalize_peak: float = DEFAULT_NORMALIZE_PEAK,
     low_b_boost_db: float = DEFAULT_LOW_B_BOOST_DB,
     low_b_boost_q: float = DEFAULT_LOW_B_BOOST_Q,
@@ -239,7 +284,7 @@ def convert_wav_to_midi(
     total_start = time.perf_counter()
     print(f"[*] Pre-processing audio: {input_wav}")
     if transpose_semitones:
-        print(f"[*] Transposing audio by {transpose_semitones:+.1f} semitones before inference...")
+        print(f"[*] Transposing audio by {transpose_semitones:+.1f} semitones before inference with {transpose_backend}...")
     if save_preprocessed_path:
         print(f"[*] Saving fully preprocessed audio to: {save_preprocessed_path}")
     temp_wav_path, _, timings = preprocess_audio(
@@ -247,6 +292,7 @@ def convert_wav_to_midi(
         lowcut,
         highcut,
         transpose_semitones,
+        transpose_backend,
         normalize_peak,
         low_b_boost_db,
         low_b_boost_q,
@@ -305,6 +351,7 @@ if __name__ == "__main__":
     parser.add_argument("--min-freq", type=float, default=LOW_B1_MIDI_FLOOR_HZ, help="Inference minimum frequency in Hz (default: 55.0 to include 7-string low B1 at 61.74 Hz)")
     parser.add_argument("--max-freq", type=float, default=DEFAULT_MAX_FREQUENCY_HZ, help="Inference maximum frequency in Hz (default: 1500.0)")
     parser.add_argument("--transpose", type=float, default=0.0, help="Pitch-shift the source audio before inference in semitones, from -12 to +12 (default: 0)")
+    parser.add_argument("--transpose-backend", choices=["ffmpeg", "librosa"], default=DEFAULT_TRANSPOSE_BACKEND, help="Backend used for pitch shifting before inference (default: ffmpeg)")
     parser.add_argument("--normalize-peak", type=float, default=DEFAULT_NORMALIZE_PEAK, help="Peak normalization target applied after preprocessing, from 0 to 1 (default: 0.98)")
     parser.add_argument("--low-b-boost-db", type=float, default=DEFAULT_LOW_B_BOOST_DB, help="Peaking EQ boost in dB around low B1 after filtering (default: 8.0)")
     parser.add_argument("--low-b-boost-q", type=float, default=DEFAULT_LOW_B_BOOST_Q, help="Q for the low B1 peaking EQ boost (default: 0.8)")
@@ -339,6 +386,7 @@ if __name__ == "__main__":
         minimum_frequency=args.min_freq,
         maximum_frequency=args.max_freq,
         transpose_semitones=args.transpose,
+        transpose_backend=args.transpose_backend,
         normalize_peak=args.normalize_peak,
         low_b_boost_db=args.low_b_boost_db,
         low_b_boost_q=args.low_b_boost_q,

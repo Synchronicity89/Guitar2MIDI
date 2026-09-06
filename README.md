@@ -63,6 +63,12 @@ Transpose the source up by one octave before transcription:
 python Convert.py Audio_Samples/andyguitar1.wav --transpose 12
 ```
 
+The default transpose backend is `ffmpeg` with the `rubberband` filter because it is much faster than the original in-process `librosa` path. You can still force the older backend for comparison:
+
+```bash
+python Convert.py Audio_Samples/andyguitar1.wav --transpose 12 --transpose-backend librosa
+```
+
 Save the fully preprocessed audio that will be sent into inference:
 
 ```bash
@@ -87,4 +93,6 @@ The repository expects sample WAV files under `Audio_Samples/`. Their contents a
 
 - Python 3.12 is not used here because the `basic-pitch` dependency stack does not resolve cleanly in this setup.
 - `setuptools` is pinned below 81 because `resampy` in the `basic-pitch` stack still relies on `pkg_resources`.
+- The official MT3 source install is currently blocked on Python 3.11 because its live `flax` dependency now requires Python 3.12.
+- `Omnizart` currently needs `python3.11-dev` in Ubuntu to build `madmom`.
 - Generated MIDI files are ignored by Git by default.

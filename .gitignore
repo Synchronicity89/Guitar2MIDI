@@ -2,6 +2,7 @@ Audio_Samples/*
 *.mid
 __pycache__/
 *.pyc
+.cookie
 audio_midi_env/
 audio_midi_env_ubuntu/
 audio_midi_env_ubuntu311/
